@@ -1,0 +1,29 @@
+# Ignore credentials
+credentials.json
+
+# Ignore tools folder
+tools/
+
+# Hoặc nếu chỉ muốn ignore riêng từng folder
+tools/chrome-win64/
+tools/RektCaptcha_Extension/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Build
+dist/
+build/
+*.spec
+
+# OS
+.DS_Store
+Thumbs.db
