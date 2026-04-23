@@ -1,0 +1,68 @@
+{
+  "aa": {
+    "sheet_id": "1cuj6slTO1wroK2OkBvd1HdyD_WKXTRmqqoC0bCEmKJE",
+    "num_pages": 14,
+    "target_domain": "https://huyenhocviet.com/",
+    "max_threads": 2,
+    "keywords": "Tài Quan Lục Thân\nChính Cục Phản Cục\nThập Thần Mệnh Lý",
+    "credentials_file": "credentials.json",
+    "jobs": [
+      {
+        "sheet_id": "1cuj6slTO1wroK2OkBvd1HdyD_WKXTRmqqoC0bCEmKJE",
+        "num_pages": 14,
+        "target_domain": "https://huyenhocviet.com/",
+        "max_threads": 2,
+        "keywords": "Tài Quan Lục Thân\nChính Cục Phản Cục\nThập Thần Mệnh Lý",
+        "credentials_file": "D:/TOOL_CHECKTOP/credentials.json",
+        "onsite_interaction_enabled": true,
+        "onsite_time_range": "48-68",
+        "extra_clicks_enabled": false,
+        "extra_click_range": "1-3"
+      },
+      {
+        "sheet_id": "1gIIXt6fC9lXR2vRhnrLJxBoIT2pIvgNfPP8Ct96_D6k",
+        "num_pages": 14,
+        "target_domain": "https://drtuananh.com/",
+        "max_threads": 2,
+        "keywords": "Treo sa trễ không đặt túi\nHút mỡ lưng vai\nNâng mũi siêu mềm",
+        "credentials_file": "D:/TOOL_CHECKTOP/credentials.json",
+        "onsite_interaction_enabled": true,
+        "onsite_time_range": "45-67",
+        "extra_clicks_enabled": false,
+        "extra_click_range": "1-3"
+      },
+      {
+        "sheet_id": "1EIHXRlUZFYvxmXDd31Dn5jcQ0QzwH6sGTllGfuRNX3s",
+        "num_pages": 14,
+        "target_domain": "https://sdtc.vn/",
+        "max_threads": 2,
+        "keywords": "Tối ưu trải nghiệm website\nWebsite chuyên nghiệp\nQuản lý nội dung website",
+        "credentials_file": "D:/TOOL_CHECKTOP/credentials.json",
+        "onsite_interaction_enabled": true,
+        "onsite_time_range": "54-73",
+        "extra_clicks_enabled": false,
+        "extra_click_range": "1-3"
+      }
+    ],
+    "ua_category": "Windows Chrome",
+    "ua_specific": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "window_width": 375,
+    "window_height": 667,
+    "headless": false,
+    "profile_path": "C:/PROFILE SEO",
+    "delete_profile": false,
+    "delay_seconds": 2,
+    "proxy_enabled": true,
+    "proxy_type": "http",
+    "proxy_list": [
+      "WwYaHByXfwLBUycDQCNjFp",
+      "NVIoqWhpHwkEqhdickfhVu",
+      "REaymiPqNxhTLIeqLZMjyJ",
+      "uFjJuETdcDiNsFGZtHdYct",
+      "UPFWmwMySvjfPGSdndAKZl",
+      "XWoJJZOQImZGwBpUSzrItA",
+      "YzpMoCDVDGQfOliiMJFvUn"
+    ],
+    "timestamp": "2026-04-23T08:59:14.990476"
+  }
+}

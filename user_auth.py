@@ -13,12 +13,14 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QFont
 from db import UserManager
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 
 
 class LoginDialog(QDialog):
     """Dialog đăng nhập/đăng ký sử dụng MongoDB"""
+
+    REMEMBER_ME_DAYS = 3
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -161,26 +163,28 @@ class LoginDialog(QDialog):
                 self.status_label.setStyleSheet("color: #4CAF50; font-size: 10px;")
                 if self.remember_me_checkbox.isChecked():
                     self.save_remember_me_session(username)
-                # Nếu là user, hiển thị thông báo dùng thử còn lại bao nhiêu ngày
+                # Nếu là user, hiển thị thông báo thời gian còn lại dựa trên expired_at
                 if role == "user":
                     user = self.user_manager.get_user(username)
-                    created = user.get("created_at")
-                    if isinstance(created, str):
-                        created = datetime.fromisoformat(created)
-                    days_left = 3 - (datetime.utcnow() - created).days
-                    if days_left > 0:
-                        QMessageBox.information(
-                            self,
-                            "Thông báo dùng thử",
-                            f"Tài khoản dùng thử còn {days_left} ngày.",
-                        )
-                    else:
-                        QMessageBox.warning(
-                            self,
-                            "Hết hạn",
-                            "Tài khoản user đã hết hạn sử dụng (3 ngày)!",
-                        )
-                        return
+                    expired = user.get("expired_at") if user else None
+                    if isinstance(expired, str):
+                        expired = datetime.fromisoformat(expired)
+                    if expired:
+                        remaining = expired - datetime.utcnow()
+                        days_left = max(0, remaining.days)
+                        if remaining.total_seconds() > 0:
+                            QMessageBox.information(
+                                self,
+                                "Thông báo dùng thử",
+                                f"Tài khoản dùng thử còn {days_left} ngày.",
+                            )
+                        else:
+                            QMessageBox.warning(
+                                self,
+                                "Hết hạn",
+                                "Tài khoản user đã hết hạn sử dụng (3 ngày)!",
+                            )
+                            return
                 QTimer.singleShot(1000, self.accept)
             else:
                 self.status_label.setText(f"❌ {msg}")
@@ -205,12 +209,16 @@ class LoginDialog(QDialog):
             # Nếu là admin thì cho chọn role, còn lại chỉ được user
             role = self.role_combo.currentText() if self.is_admin() else "user"
             # Kiểm tra đã có user với cùng thông tin máy chưa
-            if self.user_manager.users.find_one({"machine_info": machine_info}):
+            if role == "user" and self.user_manager.users.find_one({"machine_info": machine_info}):
                 self.status_label.setText("❌ Máy này đã đăng ký tài khoản trước đó!")
                 self.status_label.setStyleSheet("color: #f44336; font-size: 10px;")
                 return
             ok, msg = self.user_manager.register(
-                username, password, role=role, creator_role=self.user_role, machine_info=machine_info
+                username,
+                password,
+                role=role,
+                creator_role=self.user_role,
+                machine_info=machine_info if role == "user" else None,
             )
             if ok:
                 self.status_label.setText(
@@ -231,7 +239,10 @@ class LoginDialog(QDialog):
                 self.status_label.setStyleSheet("color: #f44336; font-size: 10px;")
 
     def save_remember_me_session(self, username):
-        session_data = {"username": username, "timestamp": datetime.now().isoformat()}
+        session_data = {
+            "username": username,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
         try:
             import json
 
@@ -240,7 +251,34 @@ class LoginDialog(QDialog):
         except Exception as e:
             print(f"Lỗi khi lưu phiên đăng nhập: {str(e)}")
 
-    def load_remember_me_session(self):
+    def _parse_iso_datetime(self, value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+
+    def _is_user_trial_expired(self, user):
+        if not user or user.get("role") != "user":
+            return False
+
+        expired = user.get("expired_at")
+        if not expired:
+            created = user.get("created_at")
+            if isinstance(created, str):
+                created = self._parse_iso_datetime(created)
+            if not created:
+                return True
+            expired = created + timedelta(days=self.REMEMBER_ME_DAYS)
+        elif isinstance(expired, str):
+            expired = self._parse_iso_datetime(expired)
+
+        if not expired:
+            return True
+        return datetime.utcnow() > expired
+
+    def load_remember_me_session(self, return_status=False):
         session_file = "session.json"
         if os.path.exists(session_file):
             try:
@@ -248,10 +286,36 @@ class LoginDialog(QDialog):
 
                 with open(session_file, "r", encoding="utf-8") as f:
                     session_data = json.load(f)
-                return session_data.get("username")
-            except:
-                return None
-        return None
+                username = session_data.get("username")
+                timestamp = self._parse_iso_datetime(session_data.get("timestamp"))
+
+                if not username or not timestamp:
+                    self.clear_remember_me_session()
+                    msg = "Phiên ghi nhớ đăng nhập không hợp lệ và đã được xóa."
+                    return (None, msg) if return_status else None
+
+                if datetime.utcnow() - timestamp > timedelta(days=self.REMEMBER_ME_DAYS):
+                    self.clear_remember_me_session()
+                    msg = "Phiên ghi nhớ đăng nhập đã hết hạn sau 3 ngày."
+                    return (None, msg) if return_status else None
+
+                user = self.user_manager.get_user(username)
+                if not user:
+                    self.clear_remember_me_session()
+                    msg = "Tài khoản đã lưu không còn tồn tại."
+                    return (None, msg) if return_status else None
+
+                if self._is_user_trial_expired(user):
+                    self.clear_remember_me_session()
+                    msg = "Tài khoản user đã hết hạn sử dụng (3 ngày)."
+                    return (None, msg) if return_status else None
+
+                return (username, None) if return_status else username
+            except Exception:
+                self.clear_remember_me_session()
+                msg = "Không thể đọc phiên ghi nhớ đăng nhập."
+                return (None, msg) if return_status else None
+        return (None, None) if return_status else None
 
     def clear_remember_me_session(self):
         session_file = "session.json"

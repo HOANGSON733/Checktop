@@ -1,6 +1,6 @@
 import sys
 import os
-from PyQt5.QtWidgets import QApplication, QDialog
+from PyQt5.QtWidgets import QApplication, QDialog, QMessageBox
 from PyQt5.QtGui import QIcon
 from gui import KeywordSearchGUI
 from login import LoginDialog
@@ -25,13 +25,17 @@ def main():
         app.setWindowIcon(QIcon(resource_path("logo1.png")))
 
         login_dialog = LoginDialog()
-        remembered_user = login_dialog.load_remember_me_session()
+        remembered_user, session_notice = login_dialog.load_remember_me_session(
+            return_status=True
+        )
 
         if remembered_user:
             window = KeywordSearchGUI(current_user=remembered_user)
             window.show()
             sys.exit(app.exec_())
         else:
+            if session_notice:
+                QMessageBox.information(login_dialog, "Phiên đăng nhập", session_notice)
             if login_dialog.exec_() == QDialog.Accepted:
                 window = KeywordSearchGUI(current_user=login_dialog.logged_in_user)
                 window.show()

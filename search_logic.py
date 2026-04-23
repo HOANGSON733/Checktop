@@ -10,6 +10,7 @@ import requests
 import sys
 import concurrent.futures
 import json
+import math
 from webdriver_manager.chrome import ChromeDriverManager
 from datetime import datetime
 from urllib.parse import urlparse
@@ -22,6 +23,8 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.service import Service
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QMimeData, QUrl
 import logging
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
 import uuid
 from pathlib import Path
 import gspread
@@ -30,12 +33,13 @@ from bs4 import BeautifulSoup
 import zipfile
 import tempfile
 import os
+import shutil
 from utils import resource_path
-
-chrome_exe_path = resource_path("tools/chrome-win64/chrome.exe")
-extension_path = resource_path("tools/RektCaptcha_Extension")
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 window_slots = []
 slot_lock = threading.Lock()
+proxy_slot_lock = threading.Lock()
+proxy_slot_counter = 0
 SCREEN_WIDTH = 1920
 SCREEN_HEIGHT = 1040
 DEFAULT_WINDOW_SIZE = (600, 800)
@@ -69,14 +73,16 @@ USER_AGENTS = {
 ALL_USER_AGENTS = [ua for uas in USER_AGENTS.values() for ua in uas]
 
 
-def get_window_slot(window_width, window_height, max_cols=3):
+def get_window_slot(window_width, window_height, max_cols=4):
     """Lấy slot trống và tính toán vị trí cửa sổ Chrome"""
     with slot_lock:
-        spacing_x = 10
-        spacing_y = 10
+        spacing_x = 24
+        spacing_y = 28
 
         # Tính số cột/hàng có thể fit trên màn hình
         cols = min(max_cols, max(1, SCREEN_WIDTH // (window_width + spacing_x)))
+        grid_width = cols * window_width + (cols - 1) * spacing_x
+        start_x = max(0, (SCREEN_WIDTH - grid_width) // 2)
 
         # Tìm slot trống
         for i, slot in enumerate(window_slots):
@@ -89,7 +95,7 @@ def get_window_slot(window_width, window_height, max_cols=3):
         row = slot_index // cols
         col = slot_index % cols
 
-        x = col * (window_width + spacing_x)
+        x = start_x + col * (window_width + spacing_x)
         y = row * (window_height + spacing_y)
 
         # Clamp vào màn hình
@@ -109,13 +115,203 @@ def release_window_slot(slot_index):
             window_slots[slot_index]["occupied"] = False
 
 
+def get_next_proxy_key(proxy_list):
+    """Cấp proxy key theo toàn bộ luồng đang chạy của app, không reset theo từng job."""
+    global proxy_slot_counter
+
+    cleaned_proxy_list = [str(key).strip() for key in (proxy_list or []) if str(key).strip()]
+    if not cleaned_proxy_list:
+        return None, None
+
+    with proxy_slot_lock:
+        key_index = proxy_slot_counter % len(cleaned_proxy_list)
+        proxy_slot_counter += 1
+        return cleaned_proxy_list[key_index], key_index
+
+
+def build_proxyxoay_url(api_key, nhamang="random", tinhthanh="0", whitelist=""):
+    """Build URL lấy proxy xoay từ key."""
+    base_url = "https://proxyxoay.shop/api/get.php"
+    params = {
+        "key": api_key,
+        "nhamang": nhamang,
+        "tinhthanh": tinhthanh,
+        "whitelist": whitelist,
+    }
+    return f"{base_url}?{urlencode(params)}"
+
+
+def parse_proxyxoay_response(response_text):
+    """Parse response từ API proxy xoay và trả về ip:port."""
+    text = (response_text or "").strip()
+    if not text:
+        return None, "Phản hồi rỗng"
+
+    # API của bạn trả plain text: ip:port hoặc http://ip:port::
+    if text.startswith("http://") or text.startswith("https://"):
+        text = text.split("//", 1)[-1]
+    text = text.rstrip(":")
+
+    # Nếu đã là ip:port thì trả luôn
+    if text.count(":") == 1 and all(part.strip() for part in text.split(":")):
+        return text, None
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None, f"Không parse được phản hồi: {text[:120]}"
+
+    if isinstance(data, dict):
+        if data.get("status") not in (100, "100", True, None):
+            return None, data.get("message", "API proxy xoay trả về lỗi")
+
+        proxy_http = data.get("proxyhttp") or data.get("proxy") or data.get("data")
+        if not proxy_http:
+            return None, "Không tìm thấy proxy trong phản hồi"
+        return str(proxy_http).strip(), None
+
+    return None, "Định dạng phản hồi không hỗ trợ"
+
+
+def simulateUserBehavior(page, options):
+    """Mô phỏng hành vi người dùng trên trang sau khi click vào website.
+
+    Sau khi vào site, trang sẽ được cuộn mượt mà, con trỏ chuột di chuyển ngẫu nhiên
+    và có thể click thêm một số link nội bộ nếu được bật. Không tự động click sang link khác ngoài ý muốn.
+    """
+    if not options or not options.get("enabled"):
+        return
+
+    min_time = int(options.get("minTime", 20))
+    max_time = int(options.get("maxTime", 60))
+    if min_time > max_time:
+        min_time, max_time = max_time, min_time
+
+    end_time = time.time() + random.randint(min_time, max_time)
+
+    try:
+        smooth_scroll_script = """
+        window.smoothScroll = function(distance, duration) {
+            const start = window.pageYOffset;
+            const startTime = performance.now();
+
+            function easeInOutQuad(t) {
+                return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+            }
+
+            function step(currentTime) {
+                const elapsed = currentTime - startTime;
+                const progress = Math.min(elapsed / duration, 1);
+                const ease = easeInOutQuad(progress);
+                window.scrollTo(0, start + distance * ease);
+                if (progress < 1) {
+                    requestAnimationFrame(step);
+                }
+            }
+
+            requestAnimationFrame(step);
+        };
+        """
+        page.execute_script(smooth_scroll_script)
+    except Exception:
+        pass
+
+    def move_mouse_randomly():
+        try:
+            from selenium.webdriver.common.action_chains import ActionChains
+
+            size = page.get_window_size()
+            width = max(300, int(size.get("width", 800)) - 30)
+            height = max(300, int(size.get("height", 600)) - 80)
+            x = random.randint(20, width)
+            y = random.randint(20, height)
+            ActionChains(page).move_by_offset(x, y).perform()
+        except Exception:
+            try:
+                page.execute_script(
+                    "window.dispatchEvent(new MouseEvent('mousemove', {clientX: arguments[0], clientY: arguments[1], bubbles: true}));",
+                    random.randint(20, 500),
+                    random.randint(20, 500),
+                )
+            except Exception:
+                pass
+
+    def click_internal_link():
+        try:
+            links = page.find_elements(By.CSS_SELECTOR, "a[href]")
+            candidates = []
+            for link in links:
+                try:
+                    href = (link.get_attribute("href") or "").strip()
+                    text = (link.text or "").strip()
+                    if not href or not text:
+                        continue
+                    if href.startswith(("javascript:", "#")):
+                        continue
+                    if any(x in href.lower() for x in ["/login", "/signup", "/cart", "/checkout"]):
+                        continue
+                    candidates.append(link)
+                except Exception:
+                    continue
+            if candidates:
+                target = random.choice(candidates[: min(len(candidates), 8)])
+                try:
+                    page.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
+                    time.sleep(random.uniform(0.3, 0.8))
+                except Exception:
+                    pass
+                try:
+                    target.click()
+                except Exception:
+                    try:
+                        page.execute_script("arguments[0].click();", target)
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            pass
+        return False
+
+    extra_clicks_remaining = int(options.get("extraClicks", 0))
+
+    while time.time() < end_time:
+        try:
+            move_mouse_randomly()
+
+            distance = random.randint(220, 520)
+            duration = random.randint(700, 1400)
+            if random.random() < 0.75:
+                page.execute_script(f"window.smoothScroll({distance}, {duration});")
+            else:
+                page.execute_script(f"window.smoothScroll(-{random.randint(80, 180)}, {random.randint(500, 900)});")
+
+            time.sleep((duration / 1000) + random.uniform(0.4, 1.2))
+
+            if random.random() < 0.35:
+                move_mouse_randomly()
+                page.execute_script(f"window.smoothScroll(-{random.randint(60, 140)}, {random.randint(400, 800)});")
+                time.sleep(random.uniform(0.4, 1.0))
+
+            if random.random() < 0.25:
+                move_mouse_randomly()
+
+            if options.get("extraClicksEnabled") and extra_clicks_remaining > 0 and random.random() < 0.35:
+                if click_internal_link():
+                    extra_clicks_remaining -= 1
+                    time.sleep(random.uniform(1.0, 2.5))
+
+            time.sleep(random.uniform(0.6, 1.6))
+        except Exception:
+            break
+
+
 # Optional: Xóa slot nếu nó ở cuối danh sách để tránh tích tụ slot rỗng
 def get_resource_path(relative_path: str, external: bool = False) -> str:
     """Get the absolute path to a resource, handling both development and packaged environments."""
     if getattr(sys, "frozen", False):
-        base_path = sys.executable if external else sys._MEIPASS
+        base_path = Path(sys.executable).resolve().parent if external else Path(sys._MEIPASS)
     else:
-        base_path = Path(__file__).parent.parent
+        base_path = Path(__file__).resolve().parent
 
     return str(Path(base_path) / relative_path)
 
@@ -128,12 +324,13 @@ def setup_chrome_options(
     window_position: tuple = (0, 0),
     user_agent: str = None,
     profile_path: str = None,
+    proxy: str = None,
 ) -> webdriver.ChromeOptions:
     """Set up Chrome options for the driver."""
     options = webdriver.ChromeOptions()
 
-    # Add extension if provided
-    if extension_path and Path(extension_path).exists():
+    # Add extension if provided (avoid loading it in headless mode to reduce startup crashes)
+    if extension_path and Path(extension_path).exists() and not headless:
         options.add_argument(f"--load-extension={extension_path}")
         options.add_argument(f"--disable-extensions-except={extension_path}")
 
@@ -152,13 +349,32 @@ def setup_chrome_options(
     options.add_argument("--no-first-run")
     options.add_argument("--disable-infobars")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--remote-allow-origins=*")
+    options.add_argument("--remote-debugging-port=0")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--allow-running-insecure-content")
 
     if user_agent:
         options.add_argument(f"--user-agent={user_agent}")
+    if proxy:
+        proxy_arg = str(proxy).strip()
+        if not proxy_arg.startswith(("http://", "https://", "socks4://", "socks5://")):
+            proxy_arg = f"http://{proxy_arg}"
+        options.add_argument(f"--proxy-server={proxy_arg}")
     if headless:
         options.add_argument("--headless=new")
+        options.add_argument("--disable-extensions")
     if profile_path:
         options.add_argument(f"--user-data-dir={profile_path}")
+
+    if os.name == "nt":
+        options.add_argument("--disable-features=RendererCodeIntegrity")
+        options.add_argument("--disable-breakpad")
+        options.add_argument("--disable-crash-reporter")
 
     return options
 
@@ -171,6 +387,7 @@ def create_chrome_driver(
     width: int = 600,
     height: int = 800,
     thread_name: str = None,
+    delete_profile: bool = False,
 ) -> webdriver.Chrome:
     """Create and configure a Chrome WebDriver instance.
 
@@ -198,39 +415,98 @@ def create_chrome_driver(
 
     try:
         # Setup paths
-        # extension_path = r"D:\Salon\GG Sea\RektCaptcha_Extension"
-        # chrome_exe_path = r"D:\Salon\GG Sea\chrome-win64\chrome.exe"
         driver_path = get_resource_path("tools/chromedriver.exe", external=True)
-        # chrome_exe_path = get_resource_path("tools/chrome-win64/chrome.exe", external=True)
-        # extension_path = get_resource_path("tools/RektCaptcha_Extension", external=True)
+        chrome_exe_path = resource_path("tools/chrome-win64/chrome.exe")
+        extension_path = resource_path("tools/RektCaptcha_Extension")
+        logging.info(f"Thread {thread_name} - Using Chrome binary: {chrome_exe_path}")
+        logging.info(f"Thread {thread_name} - Using extension path: {extension_path}")
 
-        # Create profile path - new profile each run
-        app_data_path = os.getenv("LOCALAPPDATA", Path.home())
-        # profile_path = Path(app_data_path) / "TSEO_Profiles" / f"Profile_{thread_name}_{int(time.time())}"
-        profile_path = (
-            Path(app_data_path)
-            / "TSEO_Profiles"
-            / f"Profile_{thread_name}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        )
-        profile_path.mkdir(parents=True, exist_ok=True)
+        # Create profile path - ưu tiên path từ tham số truyền vào, fallback sang thư mục mặc định
+        profile_root = None
+        try:
+            profile_root = getattr(create_chrome_driver, "profile_root", None)
+        except Exception:
+            profile_root = None
+
+        if profile_root:
+            profile_path = Path(profile_root)
+            profile_path.mkdir(parents=True, exist_ok=True)
+        else:
+            app_data_path = os.getenv("LOCALAPPDATA", str(Path.home()))
+            profile_path = (
+                Path(app_data_path)
+                / "TSEO_Profiles"
+                / f"Profile_{thread_name}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            )
+            profile_path.mkdir(parents=True, exist_ok=True)
+
+        # Ensure each thread gets a clean, isolated profile to avoid startup crashes
+        try:
+            if delete_profile and profile_path.exists():
+                shutil.rmtree(profile_path, ignore_errors=True)
+                profile_path.mkdir(parents=True, exist_ok=True)
+        except Exception as profile_cleanup_err:
+            logging.warning(
+                f"Thread {thread_name} - Could not reset profile directory: {profile_cleanup_err}"
+            )
 
         # Setup options
         options = setup_chrome_options(
-            extension_path=extension_path,
             chrome_exe_path=chrome_exe_path,
+            extension_path=extension_path,
             headless=headless_mode,
             window_size=(width, height),
             window_position=window_position,
             user_agent=user_agent or DEFAULT_USER_AGENT,
             profile_path=str(profile_path),
+            proxy=proxy,
         )
 
         # Initialize driver
         if Path(driver_path).exists():
             service = Service(executable_path=driver_path)
-            driver = webdriver.Chrome(service=service, options=options)
         else:
-            driver = webdriver.Chrome(options=options)
+            service = Service()
+
+        driver = None
+        launch_errors = []
+        attempts = [options]
+
+        # Retry once with a safer fallback configuration if Chrome crashes on startup
+        fallback_options = setup_chrome_options(
+            chrome_exe_path=chrome_exe_path,
+            extension_path=extension_path,
+            headless=headless_mode,
+            window_size=(width, height),
+            window_position=window_position,
+            user_agent=user_agent or DEFAULT_USER_AGENT,
+            profile_path=str(profile_path),
+            proxy=proxy,
+        )
+        fallback_options.add_argument("--disable-extensions")
+        fallback_options.add_argument("--disable-features=AutomationControlled")
+        fallback_options.add_argument("--remote-debugging-port=0")
+        fallback_options.add_argument("--no-sandbox")
+        fallback_options.add_argument("--disable-dev-shm-usage")
+        attempts.append(fallback_options)
+
+        for attempt_index, attempt_options in enumerate(attempts, start=1):
+            try:
+                driver = webdriver.Chrome(service=service, options=attempt_options)
+                break
+            except Exception as driver_err:
+                launch_errors.append(str(driver_err))
+                logging.warning(
+                    f"Thread {thread_name} - Chrome launch attempt {attempt_index} failed: {driver_err}"
+                )
+                driver = None
+
+        if driver is None:
+            try:
+                shutil.rmtree(profile_path, ignore_errors=True)
+            except Exception:
+                pass
+            raise RuntimeError("Chrome launch failed after retries: " + " | ".join(launch_errors[-2:]))
 
         # Set window properties
         if not headless_mode:
@@ -262,6 +538,13 @@ def create_chrome_driver(
                 original_quit()
             except Exception as e:
                 logging.error(f"Thread {thread_name} - Error during driver quit: {e}")
+            finally:
+                try:
+                    if delete_profile and profile_path.exists():
+                        shutil.rmtree(profile_path, ignore_errors=True)
+                        logging.info(f"Thread {thread_name} - Deleted profile path: {profile_path}")
+                except Exception as cleanup_err:
+                    logging.error(f"Thread {thread_name} - Failed to delete profile path: {cleanup_err}")
 
         driver.quit = custom_quit
 
@@ -326,6 +609,183 @@ class SearchThread(QThread):
         import zipfile
         import tempfile
         import os
+
+        manifest_json = """
+        {
+            "version": "1.0.0",
+            "manifest_version": 2,
+            "name": "Proxy Auth",
+            "permissions": [
+                "proxy",
+                "tabs",
+                "unlimitedStorage",
+                "storage",
+                "<all_urls>",
+                "webRequest",
+                "webRequestBlocking"
+            ],
+            "background": {
+                "scripts": ["background.js"]
+            }
+        }
+        """
+
+        background_js = f"""
+        var config = {{
+            mode: "fixed_servers",
+            rules: {{
+                singleProxy: {{
+                    scheme: "http",
+                    host: "{self.config.get('proxy_host', '')}",
+                    port: parseInt({self.config.get('proxy_port', '')})
+                }},
+                bypassList: ["localhost"]
+            }}
+        }};
+
+        chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
+
+        function callbackFn(details) {{
+            return {{
+                authCredentials: {{
+                    username: "{username}",
+                    password: "{password}"
+                }}
+            }};
+        }};
+
+        chrome.webRequest.onAuthRequired.addListener(
+            callbackFn,
+            {{urls: ["<all_urls>"]}},
+            ['blocking']
+        );
+        """
+
+        temp_dir = tempfile.mkdtemp()
+        manifest_path = os.path.join(temp_dir, "manifest.json")
+        background_path = os.path.join(temp_dir, "background.js")
+        with open(manifest_path, "w") as f:
+            f.write(manifest_json)
+        with open(background_path, "w") as f:
+            f.write(background_js)
+
+        zip_path = os.path.join(temp_dir, "proxy_auth.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.write(manifest_path, "manifest.json")
+            zf.write(background_path, "background.js")
+        return zip_path
+
+    def _click_link_with_retry(self, driver, link, url, retries=3):
+        """Thử click link nhiều lần, fallback sang JS click."""
+        for attempt in range(1, retries + 1):
+            try:
+                self.log(f"🖱️ Click thử lần {attempt}/{retries}: {url[:60]}...")
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block: 'center'});",
+                        link,
+                    )
+                    time.sleep(random.uniform(0.3, 0.8))
+                except Exception:
+                    pass
+
+                try:
+                    link.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", link)
+
+                time.sleep(random.uniform(1.0, 2.0))
+                return True
+            except Exception as e:
+                self.log(f"⚠ Click thất bại lần {attempt}/{retries}: {e}")
+                time.sleep(random.uniform(0.8, 1.5))
+        return False
+
+    def _recover_driver(self, driver, x_pos, y_pos, window_width, window_height, ua, headless):
+        """Tự mở lại driver khi session bị lỗi."""
+        try:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "config", {}).get("profile_path", ""):
+                create_chrome_driver.profile_root = self.config.get("profile_path", "")
+            else:
+                create_chrome_driver.profile_root = None
+
+            new_driver = create_chrome_driver(
+                proxy=(self.proxy_dict.get("http") if self.proxy_dict else None),
+                headless_mode=headless,
+                window_position=(x_pos, y_pos),
+                user_agent=ua,
+                width=window_width,
+                height=window_height,
+                thread_name=f"search_{self.thread_index}_recovered",
+                delete_profile=bool(getattr(self, "config", {}).get("delete_profile", False)),
+            )
+            self.driver = new_driver
+            return new_driver
+        except Exception as e:
+            self.log(f"⚠ Không thể khôi phục driver: {e}")
+            return None
+
+    def _visit_and_interact(self, driver, keyword, url, title, results, ip_address, min_time, max_time, extra_clicks=False):
+        """Vào thẳng domain và tương tác; lỗi thì chỉ log."""
+        try:
+            self.log(f"🌐 Đang vào domain: {url}")
+            driver.get(url)
+            try:
+                WebDriverWait(driver, 15).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except Exception:
+                pass
+
+            extra_click_range = self.config.get("extra_click_range", "1-3")
+            extra_click_count = 0
+            if extra_clicks and self.config.get("extra_clicks_enabled", False):
+                try:
+                    if isinstance(extra_click_range, str) and "-" in extra_click_range:
+                        parts = [p.strip() for p in extra_click_range.split("-") if p.strip()]
+                        if len(parts) == 2:
+                            extra_click_count = random.randint(int(parts[0]), int(parts[1]))
+                    elif isinstance(extra_click_range, (list, tuple)) and len(extra_click_range) == 2:
+                        extra_click_count = random.randint(int(extra_click_range[0]), int(extra_click_range[1]))
+                except Exception:
+                    extra_click_count = random.randint(1, 3)
+
+            simulateUserBehavior(
+                driver,
+                {
+                    "enabled": True,
+                    "minTime": min_time,
+                    "maxTime": max_time,
+                    "extraClicksEnabled": self.config.get("extra_clicks_enabled", False),
+                    "extraClicks": extra_click_count,
+                },
+            )
+
+            onsite_elapsed = max(0, int(random.uniform(min_time, max_time)))
+            current_url = url
+            try:
+                current_url = driver.current_url
+            except Exception:
+                pass
+
+            if results:
+                results[-1]["onsite_time"] = f"{onsite_elapsed}s"
+                results[-1]["ip_address"] = ip_address
+                results[-1]["link_click"] = current_url
+            self.log("✅ Đã tương tác xong trên site")
+            return True
+        except Exception as e:
+            self.log(f"⚠ Domain fallback thất bại, bỏ qua: {e}")
+            return False
 
         manifest_json = """
         {
@@ -583,27 +1043,54 @@ class SearchThread(QThread):
             }
             chrome_options.add_experimental_option("prefs", prefs)
 
-            # Cấu hình Proxy nếu được bật
+            # Cấu hình Proxy xoay theo key nếu được bật
             proxy_enabled = self.config.get("proxy_enabled", False)
             proxy_list = self.config.get("proxy_list", [])
             self.proxy_dict = None
 
             if proxy_enabled and proxy_list and len(proxy_list) > 0:
-                # Lấy proxy theo thread_index
-                proxy_index = self.thread_index % len(proxy_list)
-                proxy_line = proxy_list[proxy_index]
+                proxy_key, key_index = get_next_proxy_key(proxy_list)
 
-                parts = proxy_line.split(":")
-                if len(parts) == 4:
-                    host, port, username, password = parts
-                    proxy_type = self.config.get("proxy_type", "http")
-
-                    # Format proxy cho requests library
-                    proxy_url = f"{proxy_type}://{username}:{password}@{host}:{port}"
-                    self.proxy_dict = {"http": proxy_url, "https": proxy_url}
+                if proxy_key:
+                    api_url = build_proxyxoay_url(proxy_key)
                     self.log(
-                        f"🔗 Luồng {self.thread_index + 1} dùng Proxy: {host}:{port}"
+                        f"🔄 Luồng {self.thread_index + 1} đang lấy proxy từ key toàn cục #{key_index + 1}..."
                     )
+                    try:
+                        api_resp = requests.get(api_url, timeout=10)
+                        proxy_http, proxy_error = parse_proxyxoay_response(api_resp.text)
+
+                        if proxy_http:
+                            proxy_hostport = proxy_http.strip().rstrip(":")
+                            proxy_scheme = self.config.get("proxy_type", "http")
+                            proxy_url = f"{proxy_scheme}://{proxy_hostport}"
+                            self.proxy_dict = {"http": proxy_url, "https": proxy_url}
+                            host_port_text = proxy_hostport
+                            self.log(
+                                f"🔗 Luồng {self.thread_index + 1} dùng proxy xoay: {host_port_text}"
+                            )
+                            # Kiểm tra nhanh xem proxy có sống không
+                            try:
+                                test_resp = requests.get(
+                                    "https://api.ipify.org?format=json",
+                                    proxies=self.proxy_dict,
+                                    timeout=10,
+                                )
+                                self.log(
+                                    f"🌍 Luồng {self.thread_index + 1} IP qua proxy: {test_resp.text}"
+                                )
+                            except Exception as proxy_test_err:
+                                self.log(
+                                    f"⚠ Luồng {self.thread_index + 1} proxy chưa dùng được: {proxy_test_err}"
+                                )
+                        else:
+                            self.log(
+                                f"⚠ Luồng {self.thread_index + 1} không lấy được proxy từ key: {proxy_error}"
+                            )
+                    except Exception as e:
+                        self.log(
+                            f"⚠ Luồng {self.thread_index + 1} lỗi gọi API proxy xoay: {str(e)}"
+                        )
 
             driver = None
             self.log(f"🔍 Tìm kiếm: {keyword}")
@@ -617,17 +1104,20 @@ class SearchThread(QThread):
             # Khởi tạo driver bằng helper create_chrome_driver (từ test.py)
             driver = None
             try:
+                if getattr(self, "config", {}).get("profile_path", ""):
+                    create_chrome_driver.profile_root = self.config.get("profile_path", "")
+                else:
+                    create_chrome_driver.profile_root = None
+
                 driver = create_chrome_driver(
-                    proxy=(
-                        self.proxy_dict.get("http") if self.proxy_dict else None
-                    ),  # Sửa chỗ này
-                    # proxy=self.proxy_dict.get('http') if hasattr(self, 'proxy_dict') else None,
+                    proxy=(self.proxy_dict.get("http") if self.proxy_dict else None),
                     headless_mode=headless,
                     window_position=(x_pos, y_pos),
                     user_agent=ua,
                     width=window_width,
                     height=window_height,
                     thread_name=f"search_{self.thread_index}",
+                    delete_profile=bool(getattr(self, "config", {}).get("delete_profile", False)),
                 )
             except Exception as e:
                 import traceback as _tb
@@ -635,6 +1125,35 @@ class SearchThread(QThread):
                 self.log(f"⚠ Exception from create_chrome_driver: {e}")
                 self.log("\n".join(_tb.format_exception_only(type(e), e)))
                 driver = None
+
+            if not driver:
+                self.log("⚠ create_chrome_driver failed, retrying with a clean temporary profile")
+                try:
+                    temp_profile_dir = Path(tempfile.mkdtemp(prefix=f"chrome_profile_{self.thread_index}_"))
+                    retry_options = setup_chrome_options(
+                        chrome_exe_path=resource_path("tools/chrome-win64/chrome.exe"),
+                        extension_path=None,
+                        headless=headless,
+                        window_size=(window_width, window_height),
+                        window_position=(x_pos, y_pos),
+                        user_agent=ua,
+                        profile_path=str(temp_profile_dir),
+                        proxy=(self.proxy_dict.get("http") if self.proxy_dict else None),
+                    )
+                    service = Service(ChromeDriverManager().install())
+                    driver = webdriver.Chrome(service=service, options=retry_options)
+                    self.driver = driver
+                    try:
+                        driver.set_window_position(x_pos, y_pos)
+                        driver.set_window_size(window_width, window_height)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    import traceback as _tb
+
+                    self.log(f"❌ Retry with clean profile failed: {e}")
+                    self.log("\n".join(_tb.format_exception_only(type(e), e)))
+                    driver = None
 
             # If helper failed, try fallback to webdriver.Chrome with webdriver_manager
             if not driver:
@@ -887,9 +1406,38 @@ class SearchThread(QThread):
             if not check_and_solve_captcha():
                 return results
 
+            ip_address = "N/A"
+            try:
+                if self.proxy_dict:
+                    ip_resp = requests.get(
+                        "https://api.ipify.org?format=json",
+                        proxies=self.proxy_dict,
+                        timeout=8,
+                    )
+                else:
+                    ip_resp = requests.get("https://api.ipify.org?format=json", timeout=8)
+                ip_address = ip_resp.json().get("ip", "N/A")
+            except Exception:
+                pass
+
             found_position = None
             current_rank = 0
             num_pages = (num_results + 9) // 10
+
+            onsite_enabled = self.config.get("onsite_interaction_enabled", False)
+            onsite_time_range = self.config.get("onsite_time_range", "20-60")
+            min_time, max_time = 20, 60
+            try:
+                if isinstance(onsite_time_range, str) and "-" in onsite_time_range:
+                    parts = [p.strip() for p in onsite_time_range.split("-") if p.strip()]
+                    if len(parts) == 2:
+                        min_time = int(parts[0])
+                        max_time = int(parts[1])
+                elif isinstance(onsite_time_range, (list, tuple)) and len(onsite_time_range) == 2:
+                    min_time = int(onsite_time_range[0])
+                    max_time = int(onsite_time_range[1])
+            except Exception:
+                min_time, max_time = 20, 60
 
             for page in range(num_pages):
                 if not self.is_running:
@@ -925,73 +1473,11 @@ class SearchThread(QThread):
                 if not result_loaded:
                     continue
 
-                # Delay ngẫu nhiên giống người đọc trang
-                time.sleep(random.uniform(2, 3.5))
-
-                # Scroll mượt mà như lần đầu để load thêm kết quả
-                if page > 0:  # Chỉ scroll chi tiết cho trang 2+
-                    self.log(f"📜 Đang scroll trang {page + 1} để load kết quả...")
-                    try:
-                        # Inject smooth scroll
-                        smooth_scroll_script = """
-                        window.smoothScroll = function(distance, duration) {
-                            const start = window.pageYOffset;
-                            const target = start + distance;
-                            const startTime = performance.now();
-                            
-                            function easeInOutQuad(t) {
-                                return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-                            }
-                            
-                            function scroll(currentTime) {
-                                const elapsed = currentTime - startTime;
-                                const progress = Math.min(elapsed / duration, 1);
-                                const ease = easeInOutQuad(progress);
-                                window.scrollTo(0, start + distance * ease);
-                                
-                                if (progress < 1) {
-                                    requestAnimationFrame(scroll);
-                                }
-                            }
-                            
-                            requestAnimationFrame(scroll);
-                        };
-                        """
-                        driver.execute_script(smooth_scroll_script)
-
-                        scroll_height = driver.execute_script(
-                            "return document.body.scrollHeight"
-                        )
-                        scroll_distance = random.randint(300, 500)
-                        scroll_duration = random.randint(800, 1200)
-
-                        current_pos = 0
-                        while current_pos < scroll_height * 0.6:
-                            driver.execute_script(
-                                f"window.smoothScroll({scroll_distance}, {scroll_duration});"
-                            )
-                            current_pos += scroll_distance
-                            wait_time = (scroll_duration / 1000) + random.uniform(
-                                0.5, 1.5
-                            )
-                            time.sleep(wait_time)
-
-                        self.log(f"✅ Hoàn thành scroll trang {page + 1}")
-                    except Exception as e:
-                        self.log(f"⚠ Lỗi khi scroll: {str(e)}")
-
-                # Scroll xuống từ từ (giống người đọc)
-                scroll_pause_time = random.uniform(0.3, 0.7)
-                scroll_height = driver.execute_script(
-                    "return document.body.scrollHeight"
-                )
-                current_scroll = 0
-                scroll_step = 300
-
-                while current_scroll < scroll_height / 2:
-                    driver.execute_script(f"window.scrollBy(0, {scroll_step});")
-                    current_scroll += scroll_step
-                    time.sleep(scroll_pause_time)
+                # Scroll mượt giống hệt trang đầu
+                try:
+                    self.scroll_like_human(driver)
+                except Exception:
+                    pass
 
                 # Find result links - Comprehensive selectors for desktop and mobile
                 result_links = []
@@ -1131,6 +1617,14 @@ class SearchThread(QThread):
                                     self.log(
                                         f"🎯 Tìm thấy '{normalized_target}' ở vị trí #{current_rank}"
                                     )
+                                    try:
+                                        driver.execute_script(
+                                            "arguments[0].scrollIntoView({block: 'center'});",
+                                            link,
+                                        )
+                                        time.sleep(random.uniform(0.8, 1.5))
+                                    except Exception:
+                                        pass
                         else:
                             # Nếu không có domain mục tiêu, tính is_target = True cho tất cả
                             is_target = True
@@ -1148,6 +1642,19 @@ class SearchThread(QThread):
                         except:
                             pass
 
+                        onsite_start_time = datetime.now()
+                        ip_address = "N/A"
+                        try:
+                            ip_resp = requests.get(
+                                "https://api.ipify.org?format=json",
+                                proxies=getattr(self, "proxy_dict", None),
+                                timeout=8,
+                            )
+                            if ip_resp.ok:
+                                ip_address = ip_resp.json().get("ip", "N/A")
+                        except Exception:
+                            pass
+
                         results.append(
                             {
                                 "keyword": keyword,
@@ -1157,13 +1664,26 @@ class SearchThread(QThread):
                                 "url": url,
                                 "title": title,
                                 "is_target": "Có",
-                                "search_date": datetime.now().strftime(
+                                "ip_address": ip_address,
+                                "link_click": url,
+                                "onsite_time": "",
+                                "search_date": onsite_start_time.strftime(
                                     "%Y-%m-%d %H:%M:%S"
                                 ),
                             }
                         )
 
                         self.log(f"🎯 #{current_rank}: {url[:60]}...")
+
+                        if onsite_enabled and is_target:
+                            try:
+                                if self._click_link_with_retry(driver, link, url):
+                                    self._visit_and_interact(driver, keyword, url, title, results, ip_address, min_time, max_time, extra_clicks=True)
+                                else:
+                                    self.log(f"⚠ Không click được link, sẽ vào thẳng domain: {url}")
+                                    self._visit_and_interact(driver, keyword, url, title, results, ip_address, min_time, max_time, extra_clicks=True)
+                            except Exception as behavior_error:
+                                self.log(f"⚠ Lỗi tương tác trên site: {behavior_error}")
 
                     except Exception as e:
                         continue
@@ -1260,12 +1780,32 @@ class SearchThread(QThread):
                         self.log(f"⚠ Lỗi chuyển trang: {str(e)}")
                         break
 
-            if normalized_target and not found_position:
-                self.log(
-                    f"⚠ Domain '{normalized_target}' không có trong top {current_rank}"
-                )
+            if normalized_target and not found_position and self.is_running:
+                self.log(f"⚠ Không thấy '{normalized_target}' trong Google, sẽ vào thẳng domain để tương tác")
+                fallback_url = target_domain if "://" in target_domain else f"https://{target_domain}"
+                try:
+                    fallback_ok = self._visit_and_interact(driver, keyword, fallback_url, target_domain, results, ip_address, min_time, max_time, extra_clicks=True)
+                    if fallback_ok:
+                        results.append(
+                            {
+                                "keyword": keyword,
+                                "rank": "N/A",
+                                "page": "N/A",
+                                "position": "N/A",
+                                "url": fallback_url,
+                                "title": target_domain,
+                                "is_target": "Có",
+                                "ip_address": ip_address,
+                                "link_click": fallback_url,
+                                "onsite_time": f"{random.randint(min_time, max_time)}s",
+                                "search_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            }
+                        )
+                    else:
+                        self.log("⚠ Domain fallback thất bại, bỏ qua job này và tiếp tục")
+                except Exception as fallback_error:
+                    self.log(f"⚠ Domain fallback lỗi: {fallback_error}")
 
-            self.log(f"✅ Hoàn thành: Tìm được {len(results)} kết quả")
 
         except Exception as e:
             self.log(f"❌ Lỗi: {str(e)}")
@@ -1314,13 +1854,16 @@ class SearchThread(QThread):
                 "URL",
                 "Tiêu đề",
                 "Domain mục tiêu",
+                "Địa chỉ IP",
+                "Link click",
+                "Thời gian onsite",
                 "Ngày tìm kiếm",
             ]
             worksheet.append_row(headers)
 
             # Format header
             worksheet.format(
-                "A1:H1",
+                "A1:K1",
                 {
                     "textFormat": {"bold": True, "fontSize": 11},
                     "backgroundColor": {"red": 0.2, "green": 0.6, "blue": 0.86},
@@ -1342,6 +1885,9 @@ class SearchThread(QThread):
                     result["url"],
                     result["title"],
                     result["is_target"],
+                    result.get("ip_address", "N/A"),
+                    result.get("link_click", result.get("url", "N/A")),
+                    result.get("onsite_time", "N/A"),
                     result["search_date"],
                 ]
                 worksheet.append_row(row)
@@ -1379,7 +1925,7 @@ class SearchThread(QThread):
             except:
                 # Nếu chưa tồn tại, tạo mới
                 worksheet = sheet.add_worksheet(
-                    title=worksheet_name, rows=5000, cols=10
+                    title=worksheet_name, rows=5000, cols=11
                 )
 
                 # Header
@@ -1391,13 +1937,16 @@ class SearchThread(QThread):
                     "URL",
                     "Tiêu đề",
                     "Domain mục tiêu",
+                    "Địa chỉ IP",
+                    "Link click",
+                    "Thời gian onsite",
                     "Ngày tìm kiếm",
                 ]
                 worksheet.append_row(headers)
 
                 # Format header
                 worksheet.format(
-                    "A1:H1",
+                    "A1:K1",
                     {
                         "textFormat": {"bold": True, "fontSize": 11},
                         "backgroundColor": {"red": 0.2, "green": 0.6, "blue": 0.86},
@@ -1422,6 +1971,9 @@ class SearchThread(QThread):
                     result["url"],
                     result["title"],
                     result["is_target"],
+                    result.get("ip_address", "N/A"),
+                    result.get("link_click", result.get("url", "N/A")),
+                    result.get("onsite_time", "N/A"),
                     result["search_date"],
                 ]
                 worksheet.append_row(row)

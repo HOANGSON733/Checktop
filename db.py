@@ -1,34 +1,14 @@
-def ensure_default_admins():
-    """Tạo 2 tài khoản admin mặc định nếu chưa có admin nào."""
-    user_manager = UserManager()
-    admin_count = user_manager.users.count_documents({"role": "admin"})
-    if admin_count == 0:
-        # Tạo 2 admin mặc định
-        user_manager.users.insert_one({
-            "username": "admin1",
-            "password": user_manager.hash_password("admin123"),
-            "role": "admin",
-            "created_at": datetime.utcnow()
-        })
-        user_manager.users.insert_one({
-            "username": "admin2",
-            "password": user_manager.hash_password("admin123"),
-            "role": "admin",
-            "created_at": datetime.utcnow()
-        })
-        print("Đã tạo 2 tài khoản admin mặc định: admin1/admin123, admin2/admin123")
-import pymongo, os
+import hashlib
 import threading
+from datetime import datetime, timedelta
+
+import pymongo
 from dotenv import load_dotenv
 
 # ===============================
 # MODEL LAYER
 # ===============================
 
-
-
-from datetime import datetime, timedelta
-import hashlib
 
 class DatabaseConnection:
     """Singleton class để quản lý kết nối MongoDB (thread-safe)"""
@@ -89,7 +69,7 @@ class UserManager:
             "role": role,
             "created_at": now,
         }
-        if machine_info:
+        if role == "user" and machine_info:
             user_doc["machine_info"] = machine_info
         if role == "user":
             user_doc["expired_at"] = now + timedelta(days=3)
@@ -102,8 +82,20 @@ class UserManager:
             return False, "Sai tên đăng nhập hoặc mật khẩu!", None
         if user["password"] != self.hash_password(password):
             return False, "Sai tên đăng nhập hoặc mật khẩu!", None
+        role = str(user.get("role", "")).strip().lower()
+
+        if role == "admin":
+            # Dọn dữ liệu trial/machine còn sót lại từ lúc tài khoản từng là user.
+            unset_fields = {}
+            if "expired_at" in user:
+                unset_fields["expired_at"] = ""
+            if "machine_info" in user:
+                unset_fields["machine_info"] = ""
+            if unset_fields:
+                self.users.update_one({"_id": user["_id"]}, {"$unset": unset_fields})
+
         # Kiểm tra hạn sử dụng nếu là user
-        if user["role"] == "user":
+        if role == "user":
             expired = user.get("expired_at")
             if not expired:
                 # Nếu chưa có expired_at, fallback về created_at + 3 ngày
@@ -117,7 +109,7 @@ class UserManager:
                 expired = datetime.fromisoformat(expired)
             if datetime.utcnow() > expired:
                 return False, "Tài khoản user đã hết hạn sử dụng (3 ngày)!", None
-        return True, "Đăng nhập thành công!", user["role"]
+        return True, "Đăng nhập thành công!", role
 
     def get_user(self, username):
         return self.users.find_one({"username": username})
@@ -128,8 +120,42 @@ class UserManager:
             return False, "Chỉ admin mới được đổi quyền."
         if new_role not in ["admin", "tester", "user"]:
             return False, "Role không hợp lệ."
-        self.users.update_one({"username": username}, {"$set": {"role": new_role}})
+        update_ops = {"$set": {"role": new_role}}
+        unset_fields = {}
+
+        if new_role == "admin":
+            unset_fields["machine_info"] = ""
+            unset_fields["expired_at"] = ""
+
+        if unset_fields:
+            update_ops["$unset"] = unset_fields
+
+        self.users.update_one({"username": username}, update_ops)
         return True, "Đã đổi quyền thành công."
 
     def list_users(self):
         return list(self.users.find({}, {"_id": 0, "password": 0}))
+
+
+def ensure_default_admins():
+    """Tạo 2 tài khoản admin mặc định nếu chưa có admin nào."""
+    user_manager = UserManager()
+    admin_count = user_manager.users.count_documents({"role": "admin"})
+    if admin_count == 0:
+        user_manager.users.insert_one(
+            {
+                "username": "admin1",
+                "password": user_manager.hash_password("admin123"),
+                "role": "admin",
+                "created_at": datetime.utcnow(),
+            }
+        )
+        user_manager.users.insert_one(
+            {
+                "username": "admin2",
+                "password": user_manager.hash_password("admin123"),
+                "role": "admin",
+                "created_at": datetime.utcnow(),
+            }
+        )
+        print("Đã tạo 2 tài khoản admin mặc định: admin1/admin123, admin2/admin123")
