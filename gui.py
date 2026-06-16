@@ -4,6 +4,7 @@ Chứa class giao diện chính (KeywordSearchGUI) và các widget liên quan.
 """
 
 import requests
+import time
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -14,6 +15,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QTextEdit,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QGroupBox,
@@ -30,7 +32,7 @@ from PyQt5.QtWidgets import (
     QFrame,
     QScrollArea,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QPixmap
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QMimeData, QUrl
 from PyQt5.QtWebEngineWidgets import QWebEngineView
@@ -39,6 +41,9 @@ from config_utils import *
 from db import UserManager
 
 from login import LoginDialog
+
+LOG_MAX_LINES = 1500
+LOG_FLUSH_INTERVAL_MS = 150
 
 USER_AGENTS = {
     "Windows Chrome": [
@@ -116,7 +121,7 @@ class KeywordSearchGUI(QMainWindow):
             "pages": "📄 Số trang:",
             "threads": "🧵 Số luồng:",
             "domain": "🎯 Tên miền:",
-            "domain_placeholder": "VD: example.com (không bắt buộc)",
+            "domain_placeholder": "VD: https://example.com (bắt buộc)",
             "keywords": "🔑 Danh sách từ khóa",
             "keywords_placeholder": "Nhập mỗi từ khóa trên một dòng...\nVD:\nmarketing online\nseo tips\ndigital marketing",
             "keywords_count": "Số từ khóa: {}",
@@ -286,12 +291,11 @@ class KeywordSearchGUI(QMainWindow):
     def __init__(self, current_user=None):
         super().__init__()
         self.current_user = current_user  # Lưu username của người dùng hiện tại
-        self.config_file = (
-            f"config_{self.current_user}.json" if self.current_user else "config.json"
-        )
-        self.configs_list_file = (
+        self.config_store_file = (
             f"configs_{self.current_user}.json" if self.current_user else "configs.json"
-        )  # File lưu danh sách cấu hình
+        )
+        self.config_file = self.config_store_file
+        self.configs_list_file = self.config_store_file
         self.credentials_file = "credentials.json"
         self.search_thread = None
         self.search_threads = []
@@ -299,6 +303,9 @@ class KeywordSearchGUI(QMainWindow):
         self.selected_config_name = None  # Theo dõi cấu hình được chọn
         self.job_cards = []
         self.job_counter = 0
+        self.infinite_jobs_thread = None
+        self.infinite_jobs_running = False
+        self.infinite_cycle_count = 0
         self.user_manager = UserManager()
         self.current_user_role = "user"
         current_user_doc = self.user_manager.get_user(self.current_user) if self.current_user else None
@@ -475,6 +482,43 @@ class KeywordSearchGUI(QMainWindow):
         )
         self.run_all_jobs_button.clicked.connect(self.run_all_jobs)
         button_layout.addWidget(self.run_all_jobs_button)
+
+        infinite_card = QFrame()
+        infinite_card.setStyleSheet("QFrame{background:#f8fafc; border:1px solid #e5e7eb; border-radius:12px;}")
+        infinite_layout = QVBoxLayout(infinite_card)
+        infinite_layout.setContentsMargins(16, 14, 16, 14)
+        infinite_layout.setSpacing(10)
+        infinite_title = QLabel("🔁 Chạy vô hạn")
+        infinite_title.setFont(QFont("Arial", 11, QFont.Bold))
+        infinite_title.setStyleSheet("color:#111827; border:none; background:transparent;")
+        infinite_layout.addWidget(infinite_title)
+        infinite_desc = QLabel("Chạy lại toàn bộ job liên tục cho tới khi bạn bấm Dừng.")
+        infinite_desc.setWordWrap(True)
+        infinite_desc.setStyleSheet("color:#6b7280; border:none; background:transparent;")
+        infinite_layout.addWidget(infinite_desc)
+
+        infinite_controls = QHBoxLayout()
+        infinite_controls.setSpacing(10)
+        self.infinite_mode_checkbox = QCheckBox("Bật chạy vô hạn")
+        self.infinite_mode_checkbox.setStyleSheet("color:#374151; font-weight:600;")
+        infinite_controls.addWidget(self.infinite_mode_checkbox)
+        self.infinite_interval_label = QLabel("Nghỉ giữa các vòng (phút)")
+        self.infinite_interval_label.setStyleSheet("color:#374151; font-weight:600;")
+        infinite_controls.addWidget(self.infinite_interval_label)
+        self.infinite_interval_input = QSpinBox()
+        self.infinite_interval_input.setMinimum(0)
+        self.infinite_interval_input.setMaximum(1440)
+        self.infinite_interval_input.setValue(5)
+        self.infinite_interval_input.setMinimumHeight(34)
+        self.infinite_interval_input.setStyleSheet(
+            "QSpinBox{background:white; border:1px solid #d1d5db; border-radius:8px; padding:6px 8px;}"
+            "QSpinBox:focus{border:1px solid #60a5fa;}"
+        )
+        infinite_controls.addWidget(self.infinite_interval_input)
+        infinite_controls.addStretch()
+        infinite_layout.addLayout(infinite_controls)
+        config_layout.addWidget(infinite_card)
+
         config_layout.addLayout(button_layout)
 
         self.progress_bar = QProgressBar()
@@ -890,12 +934,18 @@ class KeywordSearchGUI(QMainWindow):
         group_log_layout = QVBoxLayout()
         group_log_layout.setContentsMargins(12, 16, 12, 12)
 
-        self.log_output = QTextEdit()
+        self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
+        self.log_output.setMaximumBlockCount(LOG_MAX_LINES)
         self.log_output.setStyleSheet(
-            "QTextEdit{background-color:#020617; color:#22c55e; font-family:Consolas; font-size:12px; border:1px solid #1e293b; border-radius:10px; padding:10px;}"
+            "QPlainTextEdit{background-color:#020617; color:#22c55e; font-family:Consolas; font-size:12px; border:1px solid #1e293b; border-radius:10px; padding:10px;}"
         )
         group_log_layout.addWidget(self.log_output)
+
+        self._log_pending = []
+        self._log_flush_timer = QTimer(self)
+        self._log_flush_timer.setSingleShot(True)
+        self._log_flush_timer.timeout.connect(self._flush_log_buffer)
 
         log_group.setLayout(group_log_layout)
         log_tab_layout.addWidget(log_group)
@@ -1817,6 +1867,7 @@ class KeywordSearchGUI(QMainWindow):
             "window_width": self.window_width_input.value(),
             "window_height": self.window_height_input.value(),
             "headless": self.headless_checkbox.isChecked(),
+            "profile_base": self.profile_path_input.text().strip(),
             "delay_seconds": self.delay_input.value(),
             "proxy_enabled": self.enable_proxy_checkbox.isChecked(),
             "proxy_type": self.proxy_type_combo.currentText(),
@@ -1843,6 +1894,9 @@ class KeywordSearchGUI(QMainWindow):
             return
         if card.get("thread") and card["thread"].isRunning():
             return
+        if card["threads"].value() <= 0:
+            QMessageBox.warning(self, self.t("warning"), "Số luồng phải lớn hơn 0")
+            return
 
         config = self.collect_job_config(card)
         thread = SearchThread(config, card["credentials_file"])
@@ -1860,11 +1914,29 @@ class KeywordSearchGUI(QMainWindow):
         self.run_all_jobs_button.setEnabled(True)
 
     def log(self, message):
-        """Thêm log vào output"""
-        self.log_output.append(message)
-        self.log_output.verticalScrollBar().setValue(
-            self.log_output.verticalScrollBar().maximum()
-        )
+        """Thêm log vào output (gom batch để tránh lag khi chạy lâu)"""
+        self._log_pending.append(str(message))
+        if not self._log_flush_timer.isActive():
+            self._log_flush_timer.start(LOG_FLUSH_INTERVAL_MS)
+
+    def _flush_log_buffer(self):
+        if not self._log_pending:
+            return
+        batch = self._log_pending
+        self._log_pending = []
+
+        scrollbar = self.log_output.verticalScrollBar()
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
+
+        self.log_output.setUpdatesEnabled(False)
+        try:
+            for line in batch:
+                self.log_output.appendPlainText(line)
+        finally:
+            self.log_output.setUpdatesEnabled(True)
+
+        if at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
 
     def select_credentials(self):
         """Chọn file credentials"""
@@ -1881,6 +1953,49 @@ class KeywordSearchGUI(QMainWindow):
                 self.t("selected_credentials").format(os.path.basename(file_path))
             )
 
+    def _load_config_store(self):
+        """Tải toàn bộ cấu hình đã lưu từ file."""
+        if not os.path.exists(self.configs_list_file):
+            return {}
+
+        try:
+            with open(self.configs_list_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _get_named_configs(self):
+        """Chỉ lấy các cấu hình đã lưu theo tên, bỏ qua metadata/cấu hình tổng."""
+        configs = self._load_config_store()
+        reserved_keys = {
+            "__meta__",
+            "sheet_id",
+            "num_pages",
+            "target_domain",
+            "max_threads",
+            "keywords",
+            "credentials_file",
+            "jobs",
+            "ua_category",
+            "ua_specific",
+            "window_width",
+            "window_height",
+            "headless",
+            "profile_path",
+            "delete_profile",
+            "delay_seconds",
+            "proxy_enabled",
+            "proxy_type",
+            "proxy_list",
+            "timestamp",
+        }
+        return {
+            name: value
+            for name, value in configs.items()
+            if name not in reserved_keys
+        }
+
     def save_config(self):
         """Lưu cấu hình - Merge với config cũ và thêm vào danh sách"""
         # Hỏi tên cho cấu hình
@@ -1894,15 +2009,9 @@ class KeywordSearchGUI(QMainWindow):
         config_name = config_name.strip()
 
         # Kiểm tra xem tên có bị trùng không
-        configs = {}
-        if os.path.exists(self.configs_list_file):
-            try:
-                with open(self.configs_list_file, "r", encoding="utf-8") as f:
-                    configs = json.load(f)
-            except:
-                pass
-
-        if config_name in configs:
+        configs = self._load_config_store()
+        named_configs = self._get_named_configs()
+        if config_name in named_configs:
             reply = QMessageBox.question(
                 self,
                 self.t("warning"),
@@ -1913,13 +2022,7 @@ class KeywordSearchGUI(QMainWindow):
                 return
 
         # Tải config cũ nếu có
-        old_config = {}
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    old_config = json.load(f)
-            except:
-                pass
+        old_config = configs.get("__meta__", {}).get("current", {})
 
         jobs_payload = []
         for card in self.job_cards:
@@ -2166,6 +2269,8 @@ class KeywordSearchGUI(QMainWindow):
         self.statusBar().showMessage(self.t("searching"))
 
         self.search_thread.start()
+        if self.infinite_mode_checkbox.isChecked():
+            self._start_infinite_run()
 
     def job_card_finished(self, card, thread, success, message):
         if thread in self.search_threads:
@@ -2183,8 +2288,14 @@ class KeywordSearchGUI(QMainWindow):
         self.log(message)
         self._update_running_job_ui_state()
 
+        if self.infinite_mode_checkbox.isChecked() and self.infinite_jobs_running:
+            self._schedule_infinite_restart(card)
+
     def run_all_jobs(self):
         if not self.job_cards:
+            return
+        if self.infinite_mode_checkbox.isChecked():
+            self._start_infinite_run()
             return
         started_any = False
         for card in self.job_cards:
@@ -2208,7 +2319,8 @@ class KeywordSearchGUI(QMainWindow):
             card.get("thread") and card["thread"].isRunning() for card in self.job_cards
         )
         global_running = bool(self.search_thread and self.search_thread.isRunning())
-        any_running = any_job_running or global_running
+        infinite_running = bool(self.infinite_jobs_running)
+        any_running = any_job_running or global_running or infinite_running
 
         self.stop_button.setEnabled(any_running)
         if any_running:
@@ -2230,12 +2342,20 @@ class KeywordSearchGUI(QMainWindow):
 
         if reply == QMessageBox.Yes:
             self.log("⏸ Đang dừng tìm kiếm...")
+            self.infinite_jobs_running = False
+            self._infinite_run_queue = []
+            self._infinite_idle_remaining = 0
             if self.search_thread and self.search_thread.isRunning():
                 self.search_thread.stop()
             for thread in list(self.search_threads):
                 try:
                     if thread.isRunning():
                         thread.stop()
+                except Exception:
+                    pass
+            if hasattr(self, "infinite_jobs_thread") and self.infinite_jobs_thread:
+                try:
+                    self.infinite_jobs_thread = None
                 except Exception:
                     pass
             self.stop_button.setEnabled(False)
@@ -2262,7 +2382,9 @@ class KeywordSearchGUI(QMainWindow):
         else:
             QMessageBox.warning(self, self.t("error"), message)
 
-        self._update_running_job_ui_state()
+        if self.infinite_mode_checkbox.isChecked() and self.infinite_jobs_running:
+            self._run_next_infinite_job()
+            return
 
         self._update_running_job_ui_state()
 
@@ -2385,8 +2507,7 @@ class KeywordSearchGUI(QMainWindow):
             return
 
         try:
-            with open(self.configs_list_file, "r", encoding="utf-8") as f:
-                configs = json.load(f)
+            configs = self._get_named_configs()
 
             if not configs:
                 self.config_info_label.setText(self.t("no_configs"))
@@ -2406,8 +2527,7 @@ class KeywordSearchGUI(QMainWindow):
 
         # Tải thông tin cấu hình
         try:
-            with open(self.configs_list_file, "r", encoding="utf-8") as f:
-                configs = json.load(f)
+            configs = self._get_named_configs()
 
             if config_name in configs:
                 config = configs[config_name]
@@ -2429,8 +2549,7 @@ class KeywordSearchGUI(QMainWindow):
             return
 
         try:
-            with open(self.configs_list_file, "r", encoding="utf-8") as f:
-                configs = json.load(f)
+            configs = self._get_named_configs()
 
             if self.selected_config_name not in configs:
                 QMessageBox.warning(self, self.t("error"), "Cấu hình không tồn tại")
@@ -2509,7 +2628,7 @@ class KeywordSearchGUI(QMainWindow):
             self.headless_checkbox.setChecked(config.get("headless", False))
             self.profile_path_input.setText(config.get("profile_path", ""))
             self.delete_profile_checkbox.setChecked(config.get("delete_profile", False))
-            self.delay_input.setValue(config.get("delay_seconds", 2))
+            self.delay_input.setValue(int(config.get("delay_seconds", 5)))
 
             # Áp dụng cấu hình Proxy
             self.enable_proxy_checkbox.setChecked(config.get("proxy_enabled", False))
@@ -2548,10 +2667,10 @@ class KeywordSearchGUI(QMainWindow):
             return
 
         try:
-            with open(self.configs_list_file, "r", encoding="utf-8") as f:
-                configs = json.load(f)
+            configs = self._load_config_store()
+            named_configs = self._get_named_configs()
 
-            if self.selected_config_name in configs:
+            if self.selected_config_name in named_configs:
                 del configs[self.selected_config_name]
 
                 with open(self.configs_list_file, "w", encoding="utf-8") as f:
@@ -2591,10 +2710,10 @@ class KeywordSearchGUI(QMainWindow):
             return
 
         try:
-            with open(self.configs_list_file, "r", encoding="utf-8") as f:
-                configs = json.load(f)
+            configs = self._load_config_store()
+            named_configs = self._get_named_configs()
 
-            if new_name in configs:
+            if new_name in named_configs:
                 QMessageBox.warning(
                     self, self.t("warning"), self.t("config_name_exists")
                 )
@@ -3168,6 +3287,69 @@ class KeywordSearchGUI(QMainWindow):
         result_msg = f"Kết quả: {success_count}/{len(proxy_keys)} thành công, {fail_count}/{len(proxy_keys)} thất bại"
         self.log(f"🧪 {result_msg}")
         QMessageBox.information(self, "Kết quả Test", result_msg)
+
+    def _start_infinite_run(self):
+        """Chạy vô hạn: mỗi job chạy song song, job nào xong sẽ được lặp lại sau thời gian nghỉ."""
+        if self.infinite_jobs_running:
+            return
+        if not self.job_cards:
+            QMessageBox.warning(self, self.t("warning"), "Không có job nào để chạy.")
+            return
+
+        pending_cards = [
+            card
+            for card in self.job_cards
+            if card.get("credentials_file")
+            and card["sheet_id"].text().strip()
+            and card["keywords"].toPlainText().strip()
+        ]
+        if not pending_cards:
+            QMessageBox.warning(self, self.t("warning"), "Không có job nào đủ điều kiện để chạy.")
+            return
+
+        self.infinite_jobs_running = True
+        self._infinite_job_map = {}
+        self.stop_button.setEnabled(True)
+        self.progress_bar.setVisible(True)
+        self.log(f"🔁 Bắt đầu chạy vô hạn với {len(pending_cards)} job")
+
+        for card in pending_cards:
+            self._start_infinite_job(card)
+
+    def _start_infinite_job(self, card):
+        if not self.infinite_jobs_running:
+            return
+        if card.get("thread") and card["thread"].isRunning():
+            return
+        if not card.get("credentials_file") or not card["sheet_id"].text().strip() or not card["keywords"].toPlainText().strip():
+            return
+
+        self.start_job_card(card)
+        thread = card.get("thread")
+        if thread:
+            self._infinite_job_map[id(thread)] = card
+
+    def _schedule_infinite_restart(self, card):
+        if not self.infinite_jobs_running:
+            return
+
+        interval_minutes = self.infinite_interval_input.value()
+        delay_ms = int(interval_minutes * 60 * 1000)
+        self.log(f"⏳ Job xong, đợi {interval_minutes} phút rồi chạy lại")
+        QTimer.singleShot(delay_ms, lambda c=card: self._restart_single_infinite_job(c))
+
+    def _restart_single_infinite_job(self, card):
+        if not self.infinite_jobs_running:
+            return
+        if card.get("thread") and card["thread"].isRunning():
+            return
+        self._start_infinite_job(card)
+
+    def _finish_infinite_run(self):
+        self.infinite_jobs_running = False
+        self._update_running_job_ui_state()
+        self.log("⏹ Đã dừng chạy vô hạn")
+        self._infinite_job_map = {}
 
     def update_ui_language(self):
         """Cập nhật giao diện theo ngôn ngữ"""

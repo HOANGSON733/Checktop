@@ -36,10 +36,50 @@ import os
 import shutil
 from utils import resource_path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+
+def find_local_chrome_binary() -> str:
+    """Tìm chrome.exe theo thứ tự ưu tiên: bundled tools -> system PATH -> common install paths."""
+    candidate_paths = [
+        resource_path("tools/chrome-win64/chrome.exe"),
+        get_resource_path("tools/chrome-win64/chrome.exe", external=True),
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+
+    for path in candidate_paths:
+        try:
+            if path and Path(path).exists():
+                return path
+        except Exception:
+            continue
+
+    return "chrome.exe"
+
+
+def find_local_chromedriver_path() -> str:
+    """Tìm chromedriver.exe theo thứ tự ưu tiên: bundled tools -> PATH."""
+    candidate_paths = [
+        get_resource_path("tools/chromedriver.exe", external=True),
+        resource_path("tools/chromedriver.exe"),
+        "chromedriver.exe",
+    ]
+
+    for path in candidate_paths:
+        try:
+            if path and Path(path).exists():
+                return path
+        except Exception:
+            continue
+
+    return "chromedriver.exe"
+
+
 window_slots = []
 slot_lock = threading.Lock()
 proxy_slot_lock = threading.Lock()
 proxy_slot_counter = 0
+proxy_rotation_attempts = {}
 SCREEN_WIDTH = 1920
 SCREEN_HEIGHT = 1040
 DEFAULT_WINDOW_SIZE = (600, 800)
@@ -415,8 +455,8 @@ def create_chrome_driver(
 
     try:
         # Setup paths
-        driver_path = get_resource_path("tools/chromedriver.exe", external=True)
-        chrome_exe_path = resource_path("tools/chrome-win64/chrome.exe")
+        driver_path = find_local_chromedriver_path()
+        chrome_exe_path = find_local_chrome_binary()
         extension_path = resource_path("tools/RektCaptcha_Extension")
         logging.info(f"Thread {thread_name} - Using Chrome binary: {chrome_exe_path}")
         logging.info(f"Thread {thread_name} - Using extension path: {extension_path}")
@@ -429,16 +469,13 @@ def create_chrome_driver(
             profile_root = None
 
         if profile_root:
-            profile_path = Path(profile_root)
-            profile_path.mkdir(parents=True, exist_ok=True)
+            profile_base = Path(profile_root)
         else:
             app_data_path = os.getenv("LOCALAPPDATA", str(Path.home()))
-            profile_path = (
-                Path(app_data_path)
-                / "TSEO_Profiles"
-                / f"Profile_{thread_name}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-            )
-            profile_path.mkdir(parents=True, exist_ok=True)
+            profile_base = Path(app_data_path) / "TSEO_Profiles"
+
+        profile_path = profile_base / f"Profile_{thread_name}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        profile_path.mkdir(parents=True, exist_ok=True)
 
         # Ensure each thread gets a clean, isolated profile to avoid startup crashes
         try:
@@ -473,14 +510,20 @@ def create_chrome_driver(
         attempts = [options]
 
         # Retry once with a safer fallback configuration if Chrome crashes on startup
+        fallback_profile_path = profile_path.parent / f"fallback_{profile_path.name}"
+        try:
+            fallback_profile_path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            fallback_profile_path = profile_path
+
         fallback_options = setup_chrome_options(
             chrome_exe_path=chrome_exe_path,
-            extension_path=extension_path,
+            extension_path=None,
             headless=headless_mode,
             window_size=(width, height),
             window_position=window_position,
             user_agent=user_agent or DEFAULT_USER_AGENT,
-            profile_path=str(profile_path),
+            profile_path=str(fallback_profile_path),
             proxy=proxy,
         )
         fallback_options.add_argument("--disable-extensions")
@@ -504,6 +547,8 @@ def create_chrome_driver(
         if driver is None:
             try:
                 shutil.rmtree(profile_path, ignore_errors=True)
+                if fallback_profile_path != profile_path:
+                    shutil.rmtree(fallback_profile_path, ignore_errors=True)
             except Exception:
                 pass
             raise RuntimeError("Chrome launch failed after retries: " + " | ".join(launch_errors[-2:]))
@@ -543,6 +588,9 @@ def create_chrome_driver(
                     if delete_profile and profile_path.exists():
                         shutil.rmtree(profile_path, ignore_errors=True)
                         logging.info(f"Thread {thread_name} - Deleted profile path: {profile_path}")
+                    if delete_profile and fallback_profile_path.exists() and fallback_profile_path != profile_path:
+                        shutil.rmtree(fallback_profile_path, ignore_errors=True)
+                        logging.info(f"Thread {thread_name} - Deleted fallback profile path: {fallback_profile_path}")
                 except Exception as cleanup_err:
                     logging.error(f"Thread {thread_name} - Failed to delete profile path: {cleanup_err}")
 
@@ -571,6 +619,8 @@ class SearchThread(QThread):
         self.is_running = True
         self.driver = None  # Để theo dõi driver
         self.slot_index = None  # Để theo dõi slot đang sử dụng
+        self.proxy_dict = None
+        self.proxy_failures = 0
 
     def stop(self):
         """Dừng thread"""
@@ -603,6 +653,56 @@ class SearchThread(QThread):
             return title.string if title else "N/A"
         except:
             return "N/A"
+
+    def refresh_proxy(self):
+        """Lấy lại proxy mới nếu proxy hiện tại bị lỗi."""
+        proxy_enabled = self.config.get("proxy_enabled", False)
+        proxy_list = self.config.get("proxy_list", [])
+        if not proxy_enabled or not proxy_list:
+            self.proxy_dict = None
+            return None
+
+        max_attempts = max(1, min(len(proxy_list), 5))
+        last_error = None
+        for _ in range(max_attempts):
+            proxy_key, key_index = get_next_proxy_key(proxy_list)
+            if not proxy_key:
+                break
+            try:
+                api_url = build_proxyxoay_url(proxy_key)
+                self.log(f"🔄 Luồng {self.thread_index + 1} đổi proxy key #{key_index + 1}...")
+                api_resp = requests.get(api_url, timeout=10)
+                proxy_http, proxy_error = parse_proxyxoay_response(api_resp.text)
+                if not proxy_http:
+                    last_error = proxy_error
+                    continue
+
+                proxy_hostport = proxy_http.strip().rstrip(":")
+                proxy_scheme = self.config.get("proxy_type", "http")
+                proxy_url = f"{proxy_scheme}://{proxy_hostport}"
+                test_proxy = {"http": proxy_url, "https": proxy_url}
+                try:
+                    test_resp = requests.get(
+                        "https://api.ipify.org?format=json",
+                        proxies=test_proxy,
+                        timeout=10,
+                    )
+                    self.proxy_dict = test_proxy
+                    self.proxy_failures = 0
+                    self.log(f"🔗 Luồng {self.thread_index + 1} proxy OK: {proxy_hostport}")
+                    self.log(f"🌍 IP qua proxy: {test_resp.text}")
+                    return self.proxy_dict
+                except Exception as proxy_test_err:
+                    last_error = str(proxy_test_err)
+                    self.log(f"⚠ Proxy test failed: {proxy_test_err}")
+            except Exception as e:
+                last_error = str(e)
+                self.log(f"⚠ Lỗi lấy proxy mới: {e}")
+
+        self.proxy_dict = None
+        self.proxy_failures += 1
+        self.log(f"⚠ Không lấy được proxy mới sau nhiều lần thử: {last_error}")
+        return None
 
     def create_proxy_auth_extension(self, username, password):
         """Tạo Chrome extension để authenticate proxy"""
@@ -734,16 +834,32 @@ class SearchThread(QThread):
             self.log(f"⚠ Không thể khôi phục driver: {e}")
             return None
 
+    def _is_driver_session_error(self, exc):
+        msg = str(exc).lower()
+        keywords = [
+            "winerror 10061",
+            "connection refused",
+            "invalid session id",
+            "session not created",
+            "session deleted",
+            "disconnected",
+            "chrome not reachable",
+            "/session/",
+        ]
+        return any(k in msg for k in keywords)
+
     def _visit_and_interact(self, driver, keyword, url, title, results, ip_address, min_time, max_time, extra_clicks=False):
         """Vào thẳng domain và tương tác; lỗi thì chỉ log."""
         try:
             self.log(f"🌐 Đang vào domain: {url}")
-            driver.get(url)
             try:
+                driver.get(url)
                 WebDriverWait(driver, 15).until(
                     lambda d: d.execute_script("return document.readyState") == "complete"
                 )
-            except Exception:
+            except Exception as e:
+                if self._is_driver_session_error(e):
+                    raise
                 pass
 
             extra_click_range = self.config.get("extra_click_range", "1-3")
@@ -994,7 +1110,7 @@ class SearchThread(QThread):
             # Setup Chrome options - CHE DẤU AUTOMATION TỐI ĐA
             chrome_options = Options()
             # chrome_options.binary_location = r"D:\Salon\GG Sea\chrome-win64\chrome.exe"
-            chrome_options.binary_location = resource_path("tools/chrome-win64/chrome.exe")
+            chrome_options.binary_location = find_local_chrome_binary()
 
             # Load extension
             # enxtensio_path = r"D:\Salon\GG Sea\RektCaptcha_Extension"
@@ -1049,48 +1165,7 @@ class SearchThread(QThread):
             self.proxy_dict = None
 
             if proxy_enabled and proxy_list and len(proxy_list) > 0:
-                proxy_key, key_index = get_next_proxy_key(proxy_list)
-
-                if proxy_key:
-                    api_url = build_proxyxoay_url(proxy_key)
-                    self.log(
-                        f"🔄 Luồng {self.thread_index + 1} đang lấy proxy từ key toàn cục #{key_index + 1}..."
-                    )
-                    try:
-                        api_resp = requests.get(api_url, timeout=10)
-                        proxy_http, proxy_error = parse_proxyxoay_response(api_resp.text)
-
-                        if proxy_http:
-                            proxy_hostport = proxy_http.strip().rstrip(":")
-                            proxy_scheme = self.config.get("proxy_type", "http")
-                            proxy_url = f"{proxy_scheme}://{proxy_hostport}"
-                            self.proxy_dict = {"http": proxy_url, "https": proxy_url}
-                            host_port_text = proxy_hostport
-                            self.log(
-                                f"🔗 Luồng {self.thread_index + 1} dùng proxy xoay: {host_port_text}"
-                            )
-                            # Kiểm tra nhanh xem proxy có sống không
-                            try:
-                                test_resp = requests.get(
-                                    "https://api.ipify.org?format=json",
-                                    proxies=self.proxy_dict,
-                                    timeout=10,
-                                )
-                                self.log(
-                                    f"🌍 Luồng {self.thread_index + 1} IP qua proxy: {test_resp.text}"
-                                )
-                            except Exception as proxy_test_err:
-                                self.log(
-                                    f"⚠ Luồng {self.thread_index + 1} proxy chưa dùng được: {proxy_test_err}"
-                                )
-                        else:
-                            self.log(
-                                f"⚠ Luồng {self.thread_index + 1} không lấy được proxy từ key: {proxy_error}"
-                            )
-                    except Exception as e:
-                        self.log(
-                            f"⚠ Luồng {self.thread_index + 1} lỗi gọi API proxy xoay: {str(e)}"
-                        )
+                self.refresh_proxy()
 
             driver = None
             self.log(f"🔍 Tìm kiếm: {keyword}")
@@ -1131,7 +1206,7 @@ class SearchThread(QThread):
                 try:
                     temp_profile_dir = Path(tempfile.mkdtemp(prefix=f"chrome_profile_{self.thread_index}_"))
                     retry_options = setup_chrome_options(
-                        chrome_exe_path=resource_path("tools/chrome-win64/chrome.exe"),
+                        chrome_exe_path=find_local_chrome_binary(),
                         extension_path=None,
                         headless=headless,
                         window_size=(window_width, window_height),
@@ -1189,10 +1264,11 @@ class SearchThread(QThread):
                     self.log("\n".join(_tb.format_exception_only(type(e), e)))
                     return results
 
-            # Small delay before navigation
-            # delay_seconds = self.config.get('delay_seconds', 2)
-            # if delay_seconds > 0:
-            #     time.sleep(delay_seconds)
+            # Delay trước khi bắt đầu điều hướng để khớp với tab Chrome
+            delay_seconds = float(self.config.get("delay_seconds", 2) or 0)
+            if delay_seconds > 0:
+                self.log(f"⏳ Chờ {delay_seconds}s trước khi mở Google")
+                time.sleep(delay_seconds)
 
             # Bổ sung anti-detection scripts via CDP (nếu cần)
             try:
@@ -1246,6 +1322,13 @@ class SearchThread(QThread):
                     break  # Successfully navigated
                 except Exception as e:
                     retry_count += 1
+                    if self._is_driver_session_error(e):
+                        self.log(f"⚠ Driver session bị ngắt, khởi tạo lại: {str(e)}")
+                        driver = self._recover_driver(driver, x_pos, y_pos, window_width, window_height, ua, headless)
+                        if not driver:
+                            return results
+                        retry_count = 0
+                        continue
                     if retry_count >= max_retries:
                         self.log(
                             f"❌ Không thể truy cập Google sau {max_retries} lần thử: {str(e)}"
@@ -1269,6 +1352,16 @@ class SearchThread(QThread):
             def check_and_solve_captcha(wait_after_success=True):
                 time.sleep(2)
 
+                def _reload_page_once():
+                    try:
+                        self.log("🔄 Reload trang để extension tiếp tục giải CAPTCHA...")
+                        driver.refresh()
+                        time.sleep(3)
+                        return True
+                    except Exception as reload_err:
+                        self.log(f"⚠ Không reload được trang: {reload_err}")
+                        return False
+
                 try:
                     current_url = driver.current_url
                     page_source = driver.page_source.lower()
@@ -1277,6 +1370,9 @@ class SearchThread(QThread):
 
                 if "sorry/index" in current_url or "recaptcha" in page_source:
                     self.log("⚠️ Phát hiện CAPTCHA/Checkpoint!")
+                    self.log("🔄 Reload ngay để extension tiếp tục giải CAPTCHA...")
+                    if not _reload_page_once():
+                        return False
                     self.log("⏳ Chờ extension tự giải (tối đa 120 giây)...")
 
                     for i in range(120):
@@ -1304,6 +1400,10 @@ class SearchThread(QThread):
                                         return False
                                     time.sleep(0.1)
                             return True
+
+                        if (i + 1) % 20 == 0:
+                            if not _reload_page_once():
+                                return False
 
                         if i % 5 == 0:
                             self.log(f"   ⏳ Đang chờ extension... ({i+1}/120s)")
@@ -1350,6 +1450,14 @@ class SearchThread(QThread):
             except TimeoutException:
                 self.log("❌ Không tìm thấy ô tìm kiếm")
                 return results
+            except Exception as e:
+                if self._is_driver_session_error(e):
+                    self.log(f"⚠ Driver session bị ngắt khi chờ ô tìm kiếm: {e}")
+                    driver = self._recover_driver(driver, x_pos, y_pos, window_width, window_height, ua, headless)
+                    if not driver:
+                        return results
+                    return self.search_keyword(keyword, num_results, target_domain, thread_index, window_position)
+                raise
 
             # NHẬP TỪ KHÓA TỪ TỪ (GIỐNG NGƯỜI THẬT)
             self.log(f"⌨️ Đang nhập từ khóa từ từ: '{keyword}'")
@@ -1417,8 +1525,21 @@ class SearchThread(QThread):
                 else:
                     ip_resp = requests.get("https://api.ipify.org?format=json", timeout=8)
                 ip_address = ip_resp.json().get("ip", "N/A")
-            except Exception:
-                pass
+            except Exception as e:
+                self.log(f"⚠ Không kiểm tra được IP hiện tại: {e}")
+                if self.config.get("proxy_enabled", False):
+                    self.log("🔄 Thử lấy proxy mới vì IP check thất bại...")
+                    self.refresh_proxy()
+                    try:
+                        if self.proxy_dict:
+                            ip_resp = requests.get(
+                                "https://api.ipify.org?format=json",
+                                proxies=self.proxy_dict,
+                                timeout=8,
+                            )
+                            ip_address = ip_resp.json().get("ip", "N/A")
+                    except Exception:
+                        pass
 
             found_position = None
             current_rank = 0
@@ -1683,6 +1804,11 @@ class SearchThread(QThread):
                                     self.log(f"⚠ Không click được link, sẽ vào thẳng domain: {url}")
                                     self._visit_and_interact(driver, keyword, url, title, results, ip_address, min_time, max_time, extra_clicks=True)
                             except Exception as behavior_error:
+                                if self._is_driver_session_error(behavior_error):
+                                    self.log(f"⚠ Driver session chết khi tương tác site: {behavior_error}")
+                                    driver = self._recover_driver(driver, x_pos, y_pos, window_width, window_height, ua, headless)
+                                    if driver:
+                                        continue
                                 self.log(f"⚠ Lỗi tương tác trên site: {behavior_error}")
 
                     except Exception as e:
@@ -1777,6 +1903,11 @@ class SearchThread(QThread):
                         self.log("⚠ Hết trang kết quả hoặc timeout")
                         break
                     except Exception as e:
+                        if self._is_driver_session_error(e):
+                            self.log(f"⚠ Driver session bị ngắt khi chuyển trang: {str(e)}")
+                            driver = self._recover_driver(driver, x_pos, y_pos, window_width, window_height, ua, headless)
+                            if driver:
+                                continue
                         self.log(f"⚠ Lỗi chuyển trang: {str(e)}")
                         break
 
@@ -1804,6 +1935,31 @@ class SearchThread(QThread):
                     else:
                         self.log("⚠ Domain fallback thất bại, bỏ qua job này và tiếp tục")
                 except Exception as fallback_error:
+                    if self._is_driver_session_error(fallback_error):
+                        self.log(f"⚠ Driver session chết ở fallback domain: {fallback_error}")
+                        driver = self._recover_driver(driver, x_pos, y_pos, window_width, window_height, ua, headless)
+                        if driver:
+                            try:
+                                fallback_ok = self._visit_and_interact(driver, keyword, fallback_url, target_domain, results, ip_address, min_time, max_time, extra_clicks=True)
+                                if fallback_ok:
+                                    results.append(
+                                        {
+                                            "keyword": keyword,
+                                            "rank": "N/A",
+                                            "page": "N/A",
+                                            "position": "N/A",
+                                            "url": fallback_url,
+                                            "title": target_domain,
+                                            "is_target": "Có",
+                                            "ip_address": ip_address,
+                                            "link_click": fallback_url,
+                                            "onsite_time": f"{random.randint(min_time, max_time)}s",
+                                            "search_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                        }
+                                    )
+                                    return results
+                            except Exception:
+                                pass
                     self.log(f"⚠ Domain fallback lỗi: {fallback_error}")
 
 
@@ -2056,10 +2212,11 @@ class SearchThread(QThread):
                         )
                     ] = keyword
 
-                    # Stagger: đợi delay_seconds trước khi mở Chrome tiếp theo
+                    # Stagger: đợi delay_seconds trước khi mở từ khóa tiếp theo
                     if i < len(keywords) - 1:  # Không delay sau keyword cuối
-                        delay_seconds = self.config.get("delay_seconds", 2)
+                        delay_seconds = float(self.config.get("delay_seconds", 2) or 0)
                         if delay_seconds > 0:
+                            self.log(f"⏳ Đợi {delay_seconds}s trước từ khóa tiếp theo")
                             time.sleep(delay_seconds)
                 # Thu thập kết quả từ các thread
                 completed_keywords = 0  # ← THÊM DÒNG NÀY
@@ -2088,11 +2245,6 @@ class SearchThread(QThread):
                             self.write_results_to_sheet(
                                 self.config["sheet_id"], results, worksheet_name
                             )
-                            completed_keywords += 1  # ← THÊM DÒNG NÀY
-                            self.progress_signal.emit(
-                                completed_keywords, len(keywords)
-                            )  # ← THÊM DÒNG NÀY
-
                         else:
                             # Tạo hàng thông báo không có kết quả
                             no_result = {
@@ -2114,7 +2266,14 @@ class SearchThread(QThread):
                                 self.config["sheet_id"], [no_result], worksheet_name
                             )
 
+                        completed_keywords += 1
+                        self.progress_signal.emit(
+                            completed_keywords, len(keywords)
+                        )
                         all_results.extend(results)
+                        if self.config.get("proxy_enabled", False):
+                            self.log(f"🔄 Đổi proxy sau khi xử lý '{keyword}'")
+                            self.refresh_proxy()
                     except Exception as exc:
                         self.log(f"❌ Từ khóa '{keyword}' gặp lỗi: {exc}")
 

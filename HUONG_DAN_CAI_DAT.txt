@@ -1,0 +1,33 @@
+========================================
+  CHECKTOP TOOL - HUONG DAN CAI DAT
+  SEA DRAGON TECHNOLOGY - v1.6
+========================================
+
+YEU CAU:
+- Windows 10 tro len (64-bit)
+- Ket noi Internet
+- Khong can cai Python
+
+CAC BUOC CAI DAT:
+1. Giai nen file ZIP vao mot thu muc (VD: C:\CheckTop)
+2. Mo thu muc vua giai nen
+3. Bam doi (double-click) file: CheckTop.exe
+4. Dang nhap hoac dang ky tai khoan de su dung
+
+LUU Y QUAN TRONG:
+- KHONG xoa thu muc "tools" (chua Chrome va extension)
+- KHONG tach rieng file CheckTop.exe ra khoi cac file khac
+- Neu Windows canh bao "Windows protected your PC":
+    + Bam "More info" -> "Run anyway"
+- Neu antivirus chan file, hay them thu muc vao danh sach loai tru
+
+SU DUNG LAN DAU:
+1. Dang ky tai khoan (neu chua co)
+2. Cau hinh job: Sheet ID, tu khoa, domain...
+3. Chon file credentials.json cho Google Sheets
+4. Bam "Bat dau" hoac "Chay tat ca job"
+
+HO TRO:
+- Lien he admin / nguoi ban cap tai khoan neu gap loi dang nhap
+
+========================================
