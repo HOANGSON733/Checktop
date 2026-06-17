@@ -64,7 +64,7 @@ class LoginDialog(QDialog):
     def init_ui(self):
         self.setWindowTitle("Đăng nhập - Công cụ Tìm kiếm Từ khóa")
         self.setModal(True)
-        self.setFixedSize(440, 520)
+        self.setFixedSize(460, 560)
         self.setStyleSheet("QDialog{background:#f8fafc;}")
 
         root = QVBoxLayout()
@@ -118,15 +118,15 @@ class LoginDialog(QDialog):
         root.addWidget(header)
 
         content = QVBoxLayout()
-        content.setSpacing(16)
+        content.setSpacing(18)
         content.setContentsMargins(24, 22, 24, 24)
 
         form_card = QFrame()
         form_card.setStyleSheet(
-            "QFrame{background:#ffffff; border:1px solid #e5e7eb; border-radius:14px;}"
+            "QFrame{background:#ffffff; border:1px solid #e5e7eb; border-radius:16px;}"
         )
         form_layout = QVBoxLayout(form_card)
-        form_layout.setSpacing(14)
+        form_layout.setSpacing(10)
         form_layout.setContentsMargins(18, 18, 18, 18)
 
         form_layout.addWidget(self._field_label("Tên đăng nhập"))
@@ -168,11 +168,11 @@ class LoginDialog(QDialog):
         content.addWidget(form_card)
 
         self.login_button = QPushButton("Đăng nhập")
-        self.login_button.setMinimumHeight(46)
+        self.login_button.setMinimumHeight(48)
         self.login_button.setCursor(Qt.PointingHandCursor)
         self.login_button.setStyleSheet(
             "QPushButton{background:#111827; color:white; font-weight:700; font-size:13px; "
-            "border:none; border-radius:10px; padding:10px 16px;}"
+            "border:none; border-radius:12px; padding:10px 16px;}"
             "QPushButton:hover{background:#1f2937;}"
             "QPushButton:pressed{background:#0f172a;}"
         )
@@ -180,6 +180,7 @@ class LoginDialog(QDialog):
         content.addWidget(self.login_button)
 
         switch_row = QHBoxLayout()
+        switch_row.setSpacing(6)
         switch_row.addStretch()
         self.switch_hint = QLabel("Chưa có tài khoản?")
         self.switch_hint.setStyleSheet("color:#6b7280; font-size:12px; border:none; background:transparent;")
@@ -211,7 +212,7 @@ class LoginDialog(QDialog):
         if self.mode == "login":
             self.mode = "register"
             self.setWindowTitle("Đăng ký - Công cụ Tìm kiếm Từ khóa")
-            self.setFixedSize(440, 620)
+            self.setFixedSize(460, 680)
             self.header_title.setText("Tạo tài khoản mới")
             self.header_desc.setText("Điền thông tin bên dưới để đăng ký sử dụng công cụ.")
             self.login_button.setText("Tạo tài khoản")
@@ -229,7 +230,7 @@ class LoginDialog(QDialog):
         else:
             self.mode = "login"
             self.setWindowTitle("Đăng nhập - Công cụ Tìm kiếm Từ khóa")
-            self.setFixedSize(440, 520)
+            self.setFixedSize(460, 560)
             self.header_title.setText("Đăng nhập vào hệ thống")
             self.header_desc.setText("Nhập thông tin tài khoản để tiếp tục sử dụng công cụ.")
             self.login_button.setText("Đăng nhập")
